@@ -1,4 +1,4 @@
-from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
+from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative, TimeoutError
 from math import radians, degrees, cos, sin, asin, sqrt, atan2
 from time import sleep
 import sys
@@ -11,8 +11,8 @@ connection_string='/dev/ttyAMA0'
 baud_rate=921600
 
 script_control_channel = '6'  # needs to be a string rather than a number as this is how it is handled in vehicle.channels['whatever']
-control_channel_low_boundary = 1100   # values below this mean we are in the channel's LOW state  
-control_channel_high_boundary = 1900  # values above this mean we are in the channel's HIGH state
+control_channel_boundary = 1500   # values below this mean we are in the channel's LOW state and above we in the HIGH state
+
 
 min_start_altitude = 40   # metres
 min_home_distance = 100
@@ -29,7 +29,7 @@ waypoint_alt_tolerance = 5      # as with waypoint_radius but for vertical separ
 heading_degrees_tolerance = 10  # this is how many degrees off the home bearing we will tolerate before switching off and gliding
 
 throttle_channel = 3            # self explanatory really
-throttle_off_pwm = 990  # This value should be low enough to turn off the throttle but not so low as to trigger a possible failsafe
+throttle_off_pwm = 990          # This value should be low enough to turn off the throttle but not so low as to trigger a possible failsafe
 
 
 
@@ -77,19 +77,23 @@ def vector2target(lat1, lon1, lat2, lon2):
     return {'distance': distance, 'bearing': bearing}
 
 
-def control_channel_state():
+def control_channel_is_low():
   '''
-  Returns True when channel is in HIGH PWM
-  False when channel is in LOW PWM
-  None otherwise
+  Returns True when channel is in LOW PWM
+  False otherwise
   Threshold values for HIGH and LOW are in global vars:
   control_channel_low_boundary
   control_channel_high_boundary
   '''
-  if vehicle.channels[script_control_channel] >= control_channel_high_boundary: return True
-  if vehicle.channels[script_control_channel] <= control_channel_low_boundary:
-      return False
-  else: return None
+  if vehicle.channels[script_control_channel] <= control_channel_boundary: return True
+  else: return False
+
+
+def control_channel_is_high():
+  '''
+  Kinda stupid function but also kinda handy for the wait_for()
+  '''
+  return not control_channel_is_low()
 
 # TODO this thread could be nudged by an event instead of checking and sleeping
 def channel_watcher():
@@ -98,10 +102,9 @@ def channel_watcher():
   it is to monitor the control channel and shut the script down
   if there is a change in state
   '''
-  while (control_channel_state()): sleep(.2)
+  while (control_channel_is_high()): sleep(.2)
   logger.info('Oh dear! Control channel no longer HIGH. Prep for exit...')
   graceful_exit()
-
 
 # This is cleanup. Reset pitch trim, mode and remove channel overrides
 def graceful_exit():
@@ -169,7 +172,6 @@ def gliding_config(trim_degrees):
     vehicle.parameters['TRIM_PITCH_CD'] = trim_degrees * 100
 
 
-
   
 
 
@@ -185,23 +187,25 @@ while vehicle is None:
     vehicle = connect(connection_string, wait_ready=True, baud=baud_rate)
   except:
     logger.warning('Retrying vehicle connection')
-    sleep(1)  # perhaps this will help with: SerialException: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+    sleep(2)  # perhaps this will help with: SerialException: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
 logger.info('Vehicle connection successful')
 
 
 # Check our control channel is in the LOW state
 # This is a prerequisite for the tuning to start
 logger.info('Checking control channel is at LOW state.')
-while control_channel_state():
-  warning_string = 'Channel ' + script_control_channel + ': ' + str(vehicle.channels[script_control_channel]) + '. Must be <=' + str(control_channel_low_boundary)
-  logger.warning(warning_string)
-  sleep(2)
-logger.info('Control channel at LOW state.')
+while not control_channel_is_low():
+  try:
+    vehicle.wait_for(control_channel_is_low, timeout=5, interval=0.2)
+  except TimeoutError:
+    logger.warning('Control channel not LOW. Waiting some more')
+logger.info('Control channel at LOW state. Continuing.')
+
 
 # If we reach here, we are good to go on the HIGH signal from the control channel
 # so twiddle thumbs till we get it
 logger.info('Initialisation OK. Waiting for start signal from control channel...')
-while (not control_channel_state()):
+while (control_channel_is_low()):
   sleep(.2)
 
 
@@ -241,6 +245,7 @@ for i in range(len(pitch_values_degrees)):
   if not i == 0:     # if this is the first time, we do not need to go to original location, we are already there
     goto_point(original['latitude'],
                original['longitude'], original['altitude'])
+    
   
   
 
