@@ -14,8 +14,13 @@ script_control_channel = '6'  # needs to be a string rather than a number as thi
 control_channel_low_boundary = 1100   # values below this mean we are in the channel's LOW state  
 control_channel_high_boundary = 1900  # values above this mean we are in the channel's HIGH state
 
-min_start_altitude = 40 # metres
+min_start_altitude = 40   # metres
 min_home_distance = 100
+
+min_degrees_trim = -10    # we will go this many degrees below 0 pitch trim. Make sure it is NEGATIVE!
+max_degrees_trim = 10      # we will go this many degrees above 0 pitch trim. Make sure it is POSITIVE!
+
+min_airspeed = 8    # in m/s
 
 
 
@@ -90,7 +95,15 @@ def channel_watcher():
 
 # TODO This is cleanup. Reset pitch trim and change to some human mode
 def graceful_exit():
-  logger.info('Shutting down')
+  logger.info('Cleanup started.')
+  while (not vehicle.mode == original['mode']) or (not vehicle.parameters['TRIM_PITCH_CD'] == original['trim_pitch_cd']):
+    vehicle.mode = original['mode']
+    vehicle.parameters['TRIM_PITCH_CD'] = original['trim_pitch_cd']
+    logger.info('Command for restoring mode and trim sent')
+  logger.info('Mode and trim have been restored. Exiting.')
+  sys.exit(1)   # exit 1 indicates successful, premature exit
+
+
 
 def check_initial_conditions():
   '''
@@ -167,6 +180,7 @@ logger.info('Checking initial conditions for taking over.')
 if not check_initial_conditions():
   # TODO do something less idiotic than exiting if initial conditions are not met
   logger.error('Initial condition checks failed, the script will terminate.')
+  #sys.exit('TODO: do something less idiotic than exiting if initial conditions are not met')
 logger.info('Initial conditions are met, script will now take over the vehicle.')
 
 
@@ -174,9 +188,9 @@ logger.info('Initial conditions are met, script will now take over the vehicle.'
 # Reaching here means we have passed all tests and are ready to take control of the vehicle
 
 # First, record the states of things we are going to touch so we can leave them where we found them
-original_mode = vehicle.mode.name
-original_trim_pitch = vehicle.parameters['TRIM_PITCH_CD']
-original_altitude = vehicle.location.global_relative_frame.alt
+original = {'mode': vehicle.mode.name, 'trim_pitch_cd': vehicle.parameters['TRIM_PITCH_CD'], 'altitude': vehicle.location.global_relative_frame.alt,
+            'latitude': vehicle.location.global_relative_frame.lat, 'longitude': vehicle.location.global_relative_frame.lon}
+
 
 
 
@@ -196,8 +210,26 @@ original_altitude = vehicle.location.global_relative_frame.alt
 
 
 
+##################################
+# This is how we use channel overrides https://dronekit-python.readthedocs.io/en/latest/examples/channel_overrides.html
+##################################
+# Set Ch2 override to 200 using indexing syntax
+# vehicle.channels.overrides['2'] = 200
+# Set Ch3, Ch4 override to 300,400 using dictionary syntax"
+# vehicle.channels.overrides = {'3': 300, '4': 400}
+# Clearing an override:
+# vehicle.channels.overrides['3'] = None
 
 
+##################################
+# This is how you use GUIDED (https://dronekit-python.readthedocs.io/en/latest/guide/copter/guided_mode.html#guided-mode-how-to-send-commands)
+##################################
+# Set mode to guided - this is optional as the goto method will change the mode if needed.
+# vehicle.mode = VehicleMode("GUIDED")
+
+# Set the target location in global-relative frame
+# a_location = LocationGlobalRelative(-34.364114, 149.166022, 30)
+# vehicle.simple_goto(a_location)
 
 ##################################
 # This is now you add listeners
