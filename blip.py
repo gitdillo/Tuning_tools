@@ -1,4 +1,4 @@
-from dronekit import connect, VehicleMode
+from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
 from math import radians, degrees, cos, sin, asin, sqrt, atan2
 from time import sleep
 import sys
@@ -17,15 +17,25 @@ control_channel_high_boundary = 1900  # values above this mean we are in the cha
 min_start_altitude = 40   # metres
 min_home_distance = 100
 
-min_degrees_trim = -10    # we will go this many degrees below 0 pitch trim. Make sure it is NEGATIVE!
-max_degrees_trim = 10      # we will go this many degrees above 0 pitch trim. Make sure it is POSITIVE!
+min_degrees_trim = -10          # we will go this many degrees below 0 pitch trim. Make sure it is NEGATIVE!
+max_degrees_trim = 10           # we will go this many degrees above 0 pitch trim. Make sure it is POSITIVE!
+trim_degree_step = 2            # we will step so many degrees in our tuning
 
-min_airspeed = 8    # in m/s
+min_airspeed = 8                # in m/s
+
+waypoint_radius = 10            # this is how close we return to the high waypoint before we consider it hit
+waypoint_alt_tolerance = 5      # as with waypoint_radius but for vertical separation
+
+heading_degrees_tolerance = 10  # this is how many degrees off the home bearing we will tolerate before switching off and gliding
+
+throttle_channel = 3            # self explanatory really
+throttle_off_pwm = 990  # This value should be low enough to turn off the throttle but not so low as to trigger a possible failsafe
 
 
 
 
-# Internal variables
+
+# Internal variables, best left alone
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')    # for use with our logger
 
 
@@ -41,7 +51,7 @@ def setup_logger(name, log_file, level=logging.INFO):
 
     return logger
 
-def vector2target(lon1, lat1, lon2, lat2):
+def vector2target(lat1, lon1, lat2, lon2):
     """
     Calculate the distance and bearing between two
     coordinates specified in decimal degrees
@@ -93,16 +103,17 @@ def channel_watcher():
   graceful_exit()
 
 
-# TODO This is cleanup. Reset pitch trim and change to some human mode
+# This is cleanup. Reset pitch trim, mode and remove channel overrides
 def graceful_exit():
   logger.info('Cleanup started.')
-  while (not vehicle.mode == original['mode']) or (not vehicle.parameters['TRIM_PITCH_CD'] == original['trim_pitch_cd']):
+  while (not vehicle.mode == original['mode']) or (not vehicle.parameters['TRIM_PITCH_CD'] == original['trim_pitch_cd']) or (not vehicle.channels.overrides == {}):
     vehicle.mode = original['mode']
     vehicle.parameters['TRIM_PITCH_CD'] = original['trim_pitch_cd']
-    logger.info('Command for restoring mode and trim sent')
-  logger.info('Mode and trim have been restored. Exiting.')
+    vehicle.channels.overrides = {}
+    logger.info('Commands for restoring mode, trim and channel overrides sent')
+    sleep(.2)
+  logger.info('Mode, trim and channel overrides have been restored. Exiting.')
   sys.exit(1)   # exit 1 indicates successful, premature exit
-
 
 
 def check_initial_conditions():
@@ -133,6 +144,33 @@ def check_initial_conditions():
   return True
 
 
+def goto_point(tgt_lat, tgt_lon, tgt_alt):
+  ''' Uses GUIDED to return to the high point. BLOCKS till done '''
+  # Set the target location in global-relative frame
+  a_location = LocationGlobalRelative(tgt_lat, tgt_lon, tgt_alt)
+  vehicle.simple_goto(a_location)
+  vehicle.mode = VehicleMode("GUIDED")  # just in case the simple goto didn't switch modes properly
+  vehicle.channels.overrides = {}  # disable channel overrides, just in case
+  info_string = 'Heading for point ' + str(a_location)
+  logger.info(info_string)
+  while (not vector2target(vehicle.location.global_relative_frame.lat, vehicle.location.global_relative_frame.lon, a_location.lat, a_location.lon)['distance'] < waypoint_radius) or (not abs(vehicle.location.global_relative_frame.alt - a_location.alt) < waypoint_alt_tolerance):
+    sleep(1)
+  info_string='Reached point ' + str(vehicle.location.global_relative_frame)
+  logger.info(info_string)
+
+
+def gliding_config(trim_degrees):
+  '''
+  Puts vehicle in STABILIZE, turns off throttle and trims according to argument
+  '''
+  while (not vehicle.mode == VehicleMode("STABILIZE")) or (vehicle.channels.overrides == {}) or (not vehicle.parameters['TRIM_PITCH_CD'] == trim_degrees * 100):
+    vehicle.mode = VehicleMode("STABILIZE")
+    vehicle.channels.overrides['3'] = throttle_off_pwm
+    vehicle.parameters['TRIM_PITCH_CD'] = trim_degrees * 100
+
+
+
+  
 
 
 # Start our very own logger
@@ -147,6 +185,7 @@ while vehicle is None:
     vehicle = connect(connection_string, wait_ready=True, baud=baud_rate)
   except:
     logger.warning('Retrying vehicle connection')
+    sleep(1)  # perhaps this will help with: SerialException: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
 logger.info('Vehicle connection successful')
 
 
@@ -192,6 +231,23 @@ original = {'mode': vehicle.mode.name, 'trim_pitch_cd': vehicle.parameters['TRIM
             'latitude': vehicle.location.global_relative_frame.lat, 'longitude': vehicle.location.global_relative_frame.lon}
 
 
+# Here we loop over the actual steps of pitch changes. The mechanism is as follows:
+# Go to high point
+# Set waypoint for home
+# wait till heading there within "heading_degrees_tolerance"
+# switch to STAB, override throttle to "throttle_off_pwm"
+pitch_values_degrees = range(min_degrees_trim, max_degrees_trim, trim_degree_step)
+for i in range(len(pitch_values_degrees)):
+  if not i == 0:     # if this is the first time, we do not need to go to original location, we are already there
+    goto_point(original['latitude'],
+               original['longitude'], original['altitude'])
+  
+  
+
+
+
+
+
 
 
 # TODO
@@ -228,7 +284,7 @@ original = {'mode': vehicle.mode.name, 'trim_pitch_cd': vehicle.parameters['TRIM
 # vehicle.mode = VehicleMode("GUIDED")
 
 # Set the target location in global-relative frame
-# a_location = LocationGlobalRelative(-34.364114, 149.166022, 30)
+# a_location = LocationGlobalRelative(lat, lon, alt)
 # vehicle.simple_goto(a_location)
 
 ##################################
