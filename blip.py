@@ -3,19 +3,20 @@ from math import radians, degrees, cos, sin, asin, sqrt, atan2
 from time import sleep
 import sys
 import threading
+import thread
 import logging
 
 
-# TODO These guys and more will come from a config file in the future
+# TODO These guys will come from a config file in the future
 connection_string='/dev/ttyAMA0'
-baud_rate=921600
+baud_rate = 115200
 
 script_control_channel = '6'  # needs to be a string rather than a number as this is how it is handled in vehicle.channels['whatever']
 control_channel_boundary = 1500   # values below this mean we are in the channel's LOW state and above we in the HIGH state
 
 
-min_start_altitude = 40   # metres
-min_home_distance = 100
+min_start_altitude = 40         # we need to be at least this many metres up to start gliding
+min_gliding_altitude = 20       # we won't allow the vehicle to glide below this altitude
 
 min_degrees_trim = -10          # we will go this many degrees below 0 pitch trim. Make sure it is NEGATIVE!
 max_degrees_trim = 10           # we will go this many degrees above 0 pitch trim. Make sure it is POSITIVE!
@@ -37,7 +38,14 @@ throttle_off_pwm = 990          # This value should be low enough to turn off th
 
 # Internal variables, best left alone
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')    # for use with our logger
+runflag = True          # tells the threads we are running
+record_flag = False     # tells the recording thread to record
+original = None         # this will store the various original values before we start our gliding runs
 
+
+# -----------------------------
+# Functions
+# -----------------------------
 
 def setup_logger(name, log_file, level=logging.INFO):
     """Function setup as many loggers as you want"""
@@ -102,21 +110,17 @@ def channel_watcher():
   it is to monitor the control channel and shut the script down
   if there is a change in state
   '''
-  while (control_channel_is_high()): sleep(.2)
+  while (control_channel_is_high()):
+    if not runflag: sys.exit()
+    sleep(.2)
   logger.info('Oh dear! Control channel no longer HIGH. Prep for exit...')
   graceful_exit()
 
 # This is cleanup. Reset pitch trim, mode and remove channel overrides
 def graceful_exit():
   logger.info('Cleanup started.')
-  while (not vehicle.mode == original['mode']) or (not vehicle.parameters['TRIM_PITCH_CD'] == original['trim_pitch_cd']) or (not vehicle.channels.overrides == {}):
-    vehicle.mode = original['mode']
-    vehicle.parameters['TRIM_PITCH_CD'] = original['trim_pitch_cd']
-    vehicle.channels.overrides = {}
-    logger.info('Commands for restoring mode, trim and channel overrides sent')
-    sleep(.2)
-  logger.info('Mode, trim and channel overrides have been restored. Exiting.')
-  sys.exit(1)   # exit 1 indicates successful, premature exit
+  restore_settings()
+  thread.interrupt_main()
 
 
 def check_initial_conditions():
@@ -132,12 +136,6 @@ def check_initial_conditions():
   if not vehicle.gps_0.fix_type == 3:
     logger.error('GPS error, no 3D fix')
     return False
-  
-  home_distance = vehicle.location.local_frame.distance_home()
-  if not home_distance >= min_home_distance:
-    err_string = 'Distance to home: ' + str(home_distance) + ', less than minimum of ' + str(min_home_distance)
-    logger.error(err_string)
-    return False
 
   # TODO perhaps also check the following:
   # vehicle.system_status.state == 'ACTIVE'
@@ -148,7 +146,8 @@ def check_initial_conditions():
 
 
 def goto_point(tgt_lat, tgt_lon, tgt_alt):
-  ''' Uses GUIDED to return to the high point. BLOCKS till done '''
+  ''' Uses GUIDED to return to the high point.
+  BLOCKS till done '''
   # Set the target location in global-relative frame
   a_location = LocationGlobalRelative(tgt_lat, tgt_lon, tgt_alt)
   vehicle.simple_goto(a_location)
@@ -165,14 +164,56 @@ def goto_point(tgt_lat, tgt_lon, tgt_alt):
 def gliding_config(trim_degrees):
   '''
   Puts vehicle in STABILIZE, turns off throttle and trims according to argument
+  BLOCKS till all done!
   '''
+  # We *could* use wait_for all these but since it is important they should happen FAST
+  # and sending the request multiple times can't hurt, we spam till we get it
   while (not vehicle.mode == VehicleMode("STABILIZE")) or (vehicle.channels.overrides == {}) or (not vehicle.parameters['TRIM_PITCH_CD'] == trim_degrees * 100):
     vehicle.mode = VehicleMode("STABILIZE")
     vehicle.channels.overrides['3'] = throttle_off_pwm
     vehicle.parameters['TRIM_PITCH_CD'] = trim_degrees * 100
+    sleep(.1)
 
-
+def heading_towards_home():
+  '''
+  Will return True if vehicle heading is within "heading_degrees_tolerance" of home
+  '''
+  tgt_bearing = vector2target(vehicle.location.global_relative_frame.lat, vehicle.location.global_relative_frame.lon,
+                              vehicle.home_location.lat, vehicle.home_location.lon)['bearing']
+  if (tgt_bearing - vehicle.heading) <= heading_degrees_tolerance:
+    return True
+  else:
+    return False
   
+def gliding_conditions_not_met():
+  '''
+  Returns True when conditions for gliding are not OK
+  i.e. getting too low or anything else we might think of later
+  '''
+  if vehicle.location.global_relative_frame.alt <= min_gliding_altitude:
+    return True
+
+def restore_settings():
+  '''
+  Puts the vehicle back into its initial state
+  resetting trim and channel overrides
+  '''
+  if original is None:
+    logger.info('Original values have not been recorded. Nothing to reset.')
+    return
+  while (not vehicle.mode == original['mode']) or (not vehicle.parameters['TRIM_PITCH_CD'] == original['trim_pitch_cd']) or (not vehicle.channels.overrides == {}):
+    vehicle.mode = original['mode']
+    vehicle.parameters['TRIM_PITCH_CD'] = original['trim_pitch_cd']
+    vehicle.channels.overrides = {}
+    logger.info('Commands for restoring mode, trim and channel overrides sent')
+    sleep(.2)
+  logger.info('Mode, trim and channel overrides have been restored. Exiting.')
+
+
+# -----------------------------
+# Functions no more
+# -----------------------------
+
 
 
 # Start our very own logger
@@ -194,16 +235,12 @@ logger.info('Vehicle connection successful')
 # Check our control channel is in the LOW state
 # This is a prerequisite for the tuning to start
 logger.info('Checking control channel is at LOW state.')
-while not control_channel_is_low():
-  try:
-    vehicle.wait_for(control_channel_is_low, timeout=5, interval=0.2)
-  except TimeoutError:
-    logger.warning('Control channel not LOW. Waiting some more')
+vehicle.wait_for(control_channel_is_low)
 logger.info('Control channel at LOW state. Continuing.')
 
 
-# If we reach here, we are good to go on the HIGH signal from the control channel
-# so twiddle thumbs till we get it
+# If we reach here, our contorl channel signal is LOW
+# so now we can sit back and wait till it goes HIGH
 logger.info('Initialisation OK. Waiting for start signal from control channel...')
 while (control_channel_is_low()):
   sleep(.2)
@@ -221,15 +258,18 @@ logger.info('Channel monitoring thread started.')
 # Check conditions are met for taking over
 logger.info('Checking initial conditions for taking over.')
 if not check_initial_conditions():
-  # TODO do something less idiotic than exiting if initial conditions are not met
   logger.error('Initial condition checks failed, the script will terminate.')
-  #sys.exit('TODO: do something less idiotic than exiting if initial conditions are not met')
+  runflag = False       # this will signal the thread(s) that it's time to go
+  # TODO do something less idiotic than exiting if initial conditions are not met
+  sys.exit('Termination: initial conditions not met.')
+
 logger.info('Initial conditions are met, script will now take over the vehicle.')
 
 
+# ########################################3
 # !!! Milestone !!!
 # Reaching here means we have passed all tests and are ready to take control of the vehicle
-
+# ########################################3
 # First, record the states of things we are going to touch so we can leave them where we found them
 original = {'mode': vehicle.mode.name, 'trim_pitch_cd': vehicle.parameters['TRIM_PITCH_CD'], 'altitude': vehicle.location.global_relative_frame.alt,
             'latitude': vehicle.location.global_relative_frame.lat, 'longitude': vehicle.location.global_relative_frame.lon}
@@ -237,17 +277,34 @@ original = {'mode': vehicle.mode.name, 'trim_pitch_cd': vehicle.parameters['TRIM
 
 # Here we loop over the actual steps of pitch changes. The mechanism is as follows:
 # Go to high point
-# Set waypoint for home
 # wait till heading there within "heading_degrees_tolerance"
 # switch to STAB, override throttle to "throttle_off_pwm"
 pitch_values_degrees = range(min_degrees_trim, max_degrees_trim, trim_degree_step)
 for i in range(len(pitch_values_degrees)):
-  if not i == 0:     # if this is the first time, we do not need to go to original location, we are already there
-    goto_point(original['latitude'],
-               original['longitude'], original['altitude'])
+  # if this is the first time, we do not need to go to original location, we are already there
+  if i == 0:
+    vehicle.wait_for_mode(VehicleMode("LOITER"))  # LOITER so we circle till heading home
+  # otherwise, we have reached here via GUIDED so we are circling anyway
+  
+  
+  # reaching here means we are at the high point, either because it's the first time or because we got there via goto_point()
+  # since we are in GUIDED (or LOITER if this is the first time) and circling,
+  # we wait till our heading points towards HOME, then switch to STAB and glide
+  vehicle.wait_for(heading_towards_home)
+  logger.info('Starting Glide with pitch trimmed at ' + str(pitch_values_degrees[i]) + ' degrees.')
+  gliding_config(pitch_values_degrees[i])  # takes care of the mode, trim, throttle settings
+  vehicle.wait_for(gliding_conditions_not_met, interval=0.1)
+  restore_settings()  # this will get rid of changes made by gliding_config()
+  goto_point(original['latitude'], original['longitude'], original['altitude']) # will block till we reach
+
+
     
-  
-  
+  # Set mode to guided - this is optional as the goto method will change the mode if needed.
+# vehicle.mode = VehicleMode("GUIDED")
+
+# Set the target location in global-relative frame
+# a_location = LocationGlobalRelative(lat, lon, alt)
+# vehicle.simple_goto(a_location)
 
 
 
