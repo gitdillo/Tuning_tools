@@ -1,11 +1,11 @@
 from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative, TimeoutError
 from math import radians, degrees, cos, sin, asin, sqrt, atan2
-from time import sleep
+from time import sleep, strftime
 import sys
 import threading
 import thread
 import logging
-
+import csv
 
 # TODO These guys will come from a config file in the future
 connection_string='/dev/ttyAMA0'
@@ -32,8 +32,8 @@ heading_degrees_tolerance = 10  # this is how many degrees off the home bearing 
 throttle_channel = 3            # self explanatory really
 throttle_off_pwm = 990          # This value should be low enough to turn off the throttle but not so low as to trigger a possible failsafe
 
-
-
+record_filename = 'glide.csv'   # we will save gliding data in here
+recording_period = 0.1          # we will take a recording of the glide every so many seconds
 
 
 # Internal variables, best left alone
@@ -210,6 +210,35 @@ def restore_settings():
   logger.info('Mode, trim and channel overrides have been restored. Exiting.')
 
 
+def recorder():
+  '''
+  Thread, saves gliding info into a csv
+  '''
+  try:
+    f = open(record_filename, 'wb')
+  except:
+    logger.warning('Cannot open ' + str(record_filename) + ' for writing.')
+    return
+  
+  writer = csv.writer(f, delimiter=',')
+  writer.writerow(['Time', 'Pitch', 'Lat', 'Lon', 'Alt', 'Airspeed', 'vx', 'vy', 'vz'])
+  f.flush()
+
+  while (runflag):
+    sleep(.2)
+    while (record_flag):
+      writer.writerow([strftime("%y%m%d", time.gmtime()), vehicle.parameters['TRIM_PITCH_CD'] / 100, vehicle.location.global_relative_frame.lat,
+                       vehicle.location.global_relative_frame.lon, vehicle.location.global_relative_frame.alt, vehicle.airspeed,
+                       vehicle.velocity[0], vehicle.velocity[1], vehicle.velocity[2]])
+      sleep(recording_period)
+
+  f.flush
+  f.close()
+  sys.exit()
+
+
+
+
 # -----------------------------
 # Functions no more
 # -----------------------------
@@ -253,6 +282,10 @@ monitoring_thread = threading.Thread(target=channel_watcher)
 monitoring_thread.start()
 logger.info('Channel monitoring thread started.')
 
+# Start recording thread
+logger.info('Starting recording thread')
+recording_thread = threading.Thread(target=recorder)
+recording_thread.start()
 
 
 # Check conditions are met for taking over
@@ -283,46 +316,52 @@ pitch_values_degrees = range(min_degrees_trim, max_degrees_trim, trim_degree_ste
 for i in range(len(pitch_values_degrees)):
   # if this is the first time, we do not need to go to original location, we are already there
   if i == 0:
-    vehicle.wait_for_mode(VehicleMode("LOITER"))  # LOITER so we circle till heading home
-  # otherwise, we have reached here via GUIDED so we are circling anyway
+    logger.info('First time at high point, switching to LOITER')
+    vehicle.wait_for_mode(VehicleMode("LOITER"))  # LOITER so we circle at high point
+  else:
+    logger.info('Heading for high point')
+    goto_point(original['latitude'], original['longitude'],
+               original['altitude'])  # will block till we reach
   
+  # So, now we are circling at high point either in LOITER or GUIDED
   
   # reaching here means we are at the high point, either because it's the first time or because we got there via goto_point()
   # since we are in GUIDED (or LOITER if this is the first time) and circling,
   # we wait till our heading points towards HOME, then switch to STAB and glide
   vehicle.wait_for(heading_towards_home)
   logger.info('Starting Glide with pitch trimmed at ' + str(pitch_values_degrees[i]) + ' degrees.')
-  gliding_config(pitch_values_degrees[i])  # takes care of the mode, trim, throttle settings
-  vehicle.wait_for(gliding_conditions_not_met, interval=0.1)
-  restore_settings()  # this will get rid of changes made by gliding_config()
-  goto_point(original['latitude'], original['longitude'], original['altitude']) # will block till we reach
+  gliding_config(pitch_values_degrees[i])   # takes care of the mode, trim, throttle settings
+  record_flag = True                        # start recording
+  vehicle.wait_for(gliding_conditions_not_met, interval=0.1)  # wait till we are no longer good for gliding
+  record_flag = False                       # stop recording
+  restore_settings()  # get rid of changes made by gliding_config()
+  logger.info('Glide ended')
+  
 
 
-    
+# Reaching here means we have concluded the gliding runs
+# Restore and do something reasonable
+restore_settings()
+vehicle.wait_for_mode(VehicleMode("RTL"))
+
+
+
+
+
+
+
+
+######################
+# NOTES
+######################
+
+
   # Set mode to guided - this is optional as the goto method will change the mode if needed.
 # vehicle.mode = VehicleMode("GUIDED")
 
 # Set the target location in global-relative frame
 # a_location = LocationGlobalRelative(lat, lon, alt)
 # vehicle.simple_goto(a_location)
-
-
-
-
-
-
-
-# TODO
-# Loop across trim range
-# Set GUIDED to home at max alt
-# Switch to STAB when heading home
-# Set throttle to 0
-# Change trim
-# wait till stable
-# start recording airspeed, sink
-# NEXT
-
-
 
 
 
