@@ -188,9 +188,9 @@ def heading_towards_home():
 def gliding_conditions_not_met():
   '''
   Returns True when conditions for gliding are not OK
-  i.e. getting too low or anything else we might think of later
+  i.e. getting too low or too slow or anything else we might think of later
   '''
-  if vehicle.location.global_relative_frame.alt <= min_gliding_altitude:
+  if (vehicle.location.global_relative_frame.alt <= min_gliding_altitude) or (vehicle.airspeed <= min_airspeed):
     return True
 
 def restore_settings():
