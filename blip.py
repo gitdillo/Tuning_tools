@@ -120,6 +120,11 @@ def channel_watcher():
 def graceful_exit():
   logger.info('Cleanup started.')
   restore_settings()
+  logger.info('Settings restored.')
+  vehicle.wait_for_mode(VehicleMode("RTL"))
+  logger.info('MODE switched to RTL')
+  runflag = False
+  record_flag = False
   thread.interrupt_main()
 
 
@@ -190,7 +195,10 @@ def gliding_conditions_not_met():
   Returns True when conditions for gliding are not OK
   i.e. getting too low or too slow or anything else we might think of later
   '''
-  if (vehicle.location.global_relative_frame.alt <= min_gliding_altitude) or (vehicle.airspeed <= min_airspeed):
+  if (vehicle.airspeed <= min_airspeed):
+    graceful_exit()   # if airspeed drops too low, exit the script
+    return True
+  if (vehicle.location.global_relative_frame.alt <= min_gliding_altitude):
     return True
 
 def restore_settings():
@@ -210,6 +218,7 @@ def restore_settings():
   logger.info('Mode, trim and channel overrides have been restored. Exiting.')
 
 
+# Thread target
 def recorder():
   '''
   Thread, saves gliding info into a csv
@@ -340,9 +349,7 @@ for i in range(len(pitch_values_degrees)):
 
 
 # Reaching here means we have concluded the gliding runs
-# Restore and do something reasonable
-restore_settings()
-vehicle.wait_for_mode(VehicleMode("RTL"))
+graceful_exit()
 
 
 
